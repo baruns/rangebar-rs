@@ -1,10 +1,10 @@
 [package]
-name = "rangebar"
+name = "rangebar-rs"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "rangebar"
+name = "rangebar_rs"
 crate-type = ["cdylib"]
 path = "lib.rs"
 

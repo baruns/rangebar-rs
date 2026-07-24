@@ -1,4 +1,4 @@
-# RangeBar
+# rangebar-rs
 
 A high-performance, thread-safe Rust + PyO3 Python extension for generating **Range Bars** from tick, bulk price, or OHLC data. Built with [Polars](https://pola.rs/) for fast DataFrame operations and [maturin](https://github.com/PyO3/maturin) for building.
 
@@ -33,7 +33,7 @@ Range bars are a type of price chart where each bar represents a fixed price ran
 ```bash
 pip install maturin polars pandas
 maturin build
-pip install target/wheels/rangebar-*.whl
+pip install target/wheels/rangebar_rs-*.whl
 ```
 
 Or for development (requires a virtual environment):
@@ -51,7 +51,7 @@ maturin develop
 ```python
 import polars as pl
 from datetime import datetime
-from rangebar import RangeBar
+from rangebar_rs import RangeBar
 
 rb = RangeBar(range_size=10)
 
@@ -371,7 +371,7 @@ print(result.columns)
 ## Project Structure
 
 ```
-rangebar/
+rangebar-rs/
 ├── Cargo.toml        # Rust dependencies and build config
 ├── pyproject.toml    # Python package metadata and maturin config
 ├── lib.rs            # Python module entry point (exposes RangeBar class)

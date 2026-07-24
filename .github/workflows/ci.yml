@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           python -c "
-          from rangebar import RangeBar
+          from rangebar_rs import RangeBar
           from datetime import datetime
           rb = RangeBar(range_size=10)
           rb.update_tick(ltp=100.0, ltq=1.0, datetime=datetime(2024, 1, 1, 12, 0, 0))
