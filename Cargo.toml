@@ -1,0 +1,14 @@
+[package]
+name = "rangebar"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rangebar"
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+polars = { version = "0.54", default-features = false, features = ["dtype-datetime", "dtype-i8", "fmt"] }
+pyo3-polars = "0.27"
