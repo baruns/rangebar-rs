@@ -164,18 +164,19 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
                 let lower = round4(bar.open - range_size);
 
                 if price > upper {
-                    bar.high = upper;
-                    bar.close = upper;
+                    bar.high = bar.low + range_size;
+                    bar.close = bar.high;
                     bar.datetime_end = event.datetime_ns;
                     bar.timestamp_end = event.timestamp;
                     let finished = bar.clone();
                     completed_bars.push(finished);
 
+                    let new_open = bar.close;
                     *bar = BarBuilder {
-                        open: upper,
-                        high: upper,
-                        low: upper,
-                        close: upper,
+                        open: new_open,
+                        high: new_open,
+                        low: new_open,
+                        close: new_open,
                         volume: 0.0,
                         tick_count: 0,
                         datetime_start: event.datetime_ns,
@@ -185,18 +186,19 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
                         ohlc_rows: HashMap::new(),
                     };
                 } else if price < lower {
-                    bar.low = lower;
-                    bar.close = lower;
+                    bar.low = bar.high - range_size;
+                    bar.close = bar.low;
                     bar.datetime_end = event.datetime_ns;
                     bar.timestamp_end = event.timestamp;
                     let finished = bar.clone();
                     completed_bars.push(finished);
 
+                    let new_open = bar.close;
                     *bar = BarBuilder {
-                        open: lower,
-                        high: lower,
-                        low: lower,
-                        close: lower,
+                        open: new_open,
+                        high: new_open,
+                        low: new_open,
+                        close: new_open,
                         volume: 0.0,
                         tick_count: 0,
                         datetime_start: event.datetime_ns,
@@ -227,7 +229,40 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
                             bar.volume += volume;
                         }
                     }
-                    break;
+
+                    // Check if range exceeds range_size
+                    if bar.high - bar.low > range_size {
+                        // Close the bar and adjust high/low
+                        if price > bar.open {
+                            // Price moved up, close at upper adjusted boundary
+                            bar.high = bar.low + range_size;
+                            bar.close = bar.high;
+                        } else {
+                            // Price moved down, close at lower adjusted boundary
+                            bar.low = bar.high - range_size;
+                            bar.close = bar.low;
+                        }
+                        let finished = bar.clone();
+                        completed_bars.push(finished);
+
+                        let new_open = bar.close;
+                        *bar = BarBuilder {
+                            open: new_open,
+                            high: new_open,
+                            low: new_open,
+                            close: new_open,
+                            volume: 0.0,
+                            tick_count: 0,
+                            datetime_start: event.datetime_ns,
+                            datetime_end: event.datetime_ns,
+                            timestamp_start: event.timestamp,
+                            timestamp_end: event.timestamp,
+                            ohlc_rows: HashMap::new(),
+                        };
+                        // Continue loop to process same price in new bar
+                    } else {
+                        break;
+                    }
                 }
             },
         }
