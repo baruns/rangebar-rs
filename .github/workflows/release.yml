@@ -167,67 +167,6 @@ jobs:
           sys.exit(result.returncode)
           "
 
-  macos-x86_64:
-    name: macOS Intel
-    runs-on: macos-13
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment:
-      name: pypi
-      url: https://pypi.org/p/rangebar-rs
-    permissions:
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          allow-prereleases: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: x86_64
-          args: --release --out dist --interpreter python${{ matrix.python-version }}
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
-          MACOSX_DEPLOYMENT_TARGET: '10.12'
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-macos-x86_64-py${{ matrix.python-version }}
-          path: dist/*.whl
-
-      - name: Publish to PyPI
-        shell: bash
-        run: |
-          pip install twine
-          python -c "
-          import json, os, urllib.request, subprocess, sys, glob
-          url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=pypi'
-          req = urllib.request.Request(url, headers={'Authorization': 'bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
-          oidc = json.loads(urllib.request.urlopen(req).read())['value']
-          data = json.dumps({'token': oidc}).encode()
-          req2 = urllib.request.Request('https://pypi.org/_/oidc/mint-token', data=data, headers={'Content-Type': 'application/json'})
-          pypi_token = json.loads(urllib.request.urlopen(req2).read())['token']
-          files = glob.glob('dist/*')
-          env = os.environ.copy()
-          env['TWINE_USERNAME'] = '__token__'
-          env['TWINE_PASSWORD'] = pypi_token
-          result = subprocess.run([sys.executable, '-m', 'twine', 'upload'] + files + ['--skip-existing'], env=env)
-          sys.exit(result.returncode)
-          "
 
   macos-aarch64:
     name: macOS Apple Silicon
