@@ -328,10 +328,9 @@ jobs:
       - linux-x86_64
       - linux-aarch64
       - windows-x86_64
-      - macos-x86_64
       - macos-aarch64
       - sdist
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
