@@ -507,9 +507,6 @@ fn extract_price_col(col: &Series, col_name: &str) -> PyResult<Vec<f64>> {
                 col_name
             )));
         }
-        if round4(*v) <= 0.0 {
-            return Err(PyValueError::new_err(format!("{} must be > 0", col_name)));
-        }
     }
     Ok(values.into_iter().map(round4).collect())
 }
@@ -663,6 +660,10 @@ impl RangeBar {
             let mut state = state_arc.write().map_err(|_| "lock poisoned".to_string())?;
             let mut events = Vec::with_capacity(n);
             for i in 0..n {
+                // Skip rows where price <= 0
+                if prices[i] <= 0.0 {
+                    continue;
+                }
                 let ts = timestamps.as_ref().map(|t| t[i]);
                 events.push(RawEvent {
                     price: prices[i],
@@ -740,6 +741,12 @@ impl RangeBar {
                 let h = highs[i];
                 let l = lows[i];
                 let c = closes[i];
+                
+                // Skip rows where any of open/high/low/close <= 0
+                if o <= 0.0 || h <= 0.0 || l <= 0.0 || c <= 0.0 {
+                    continue;
+                }
+                
                 let dt = datetimes[i];
                 let ts = timestamps.as_ref().map(|t| t[i]);
                 let vol = volumes[i];
