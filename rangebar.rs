@@ -705,8 +705,8 @@ impl RangeBar {
             .map(|c| c.as_materialized_series().clone());
 
         let opens = extract_price_col(&open_series, "open")?;
-        let highs = extract_price_col(&high_series, "high")?;
-        let lows = extract_price_col(&low_series, "low")?;
+        let mut highs = extract_price_col(&high_series, "high")?;
+        let mut lows = extract_price_col(&low_series, "low")?;
         let closes = extract_price_col(&close_series, "close")?;
         let (volumes, is_int_volume) = extract_volume_col(&volume_series)?;
         let datetimes = extract_datetime_ns(&datetime_series)?;
@@ -719,20 +719,15 @@ impl RangeBar {
         let n = opens.len();
         for i in 0..n {
             let o = opens[i];
-            let h = highs[i];
-            let l = lows[i];
             let c = closes[i];
+            let l = lows[i];
+            let h = highs[i];
+
             if h < o.max(c).max(l) {
-                return Err(PyValueError::new_err(format!(
-                    "row {}: high must be >= max(open, close, low)",
-                    i
-                )));
+                highs[i] = o.max(c).max(l);
             }
-            if l > o.min(c).min(h) {
-                return Err(PyValueError::new_err(format!(
-                    "row {}: low must be <= min(open, close, high)",
-                    i
-                )));
+            if l > o.min(c).min(highs[i]) {
+                lows[i] = o.min(c).min(highs[i]);
             }
         }
 
