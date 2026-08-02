@@ -1,10 +1,11 @@
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use polars::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
+
+const MAX_RANGE_BARS: usize = 10_000_000;
 
 fn round4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
@@ -61,31 +62,31 @@ fn to_polars_df(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<DataFrame> {
 
 #[derive(Clone, Debug)]
 enum EventKind {
-    Ohlc { row_id: u64 },
-    Price { volume: f64 },
-    Single { volume: f64 },
+    Ohlc {
+        prices: [f64; 4],
+        volume: f64,
+        is_int_volume: bool,
+    },
+    Price {
+        volume: f64,
+    },
+    Single {
+        volume: f64,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct RawEvent {
-    price: f64,
+    price: Option<f64>,
     datetime_ns: i64,
     timestamp: Option<i64>,
     seq: u64,
     kind: EventKind,
 }
 
-#[derive(Clone, Debug)]
-struct OhlcRowMeta {
-    volume: f64,
-    is_int_volume: bool,
-}
-
 struct InnerState {
     events: Vec<RawEvent>,
-    ohlc_meta: Vec<OhlcRowMeta>,
     next_seq: u64,
-    next_row_id: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -100,9 +101,9 @@ struct BarBuilder {
     datetime_end: i64,
     timestamp_start: Option<i64>,
     timestamp_end: Option<i64>,
-    ohlc_rows: std::collections::HashSet<u64>,
 }
 
+#[derive(Debug)]
 struct OutputBar {
     open: f64,
     high: f64,
@@ -116,84 +117,142 @@ struct OutputBar {
     timestamp_end: Option<i64>,
 }
 
-fn compute_range_bars(
-    events: &[RawEvent],
-    ohlc_meta: &[OhlcRowMeta],
-    range_size: f64,
-) -> (Vec<OutputBar>, bool) {
-    let has_all_timestamps = !events.is_empty() && events.iter().all(|e| e.timestamp.is_some());
+fn push_bar(bars: &mut Vec<BarBuilder>, bar: BarBuilder) -> Result<(), String> {
+    if bars.len() >= MAX_RANGE_BARS {
+        return Err(format!(
+            "range-bar output exceeds the safety limit of {MAX_RANGE_BARS} bars; increase range_size or check the input price scale"
+        ));
+    }
+    bars.try_reserve(1).map_err(|_| {
+        "not enough memory to create range bars; increase range_size or process a smaller price span"
+            .to_string()
+    })?;
+    bars.push(bar);
+    Ok(())
+}
 
-    if events.is_empty() {
-        return (Vec::new(), has_all_timestamps);
+fn process_price(
+    all_bars: &mut Vec<BarBuilder>,
+    price: f64,
+    event: &RawEvent,
+    volume: Option<f64>,
+    range_size: f64,
+) -> Result<usize, String> {
+    if all_bars.is_empty() {
+        push_bar(
+            all_bars,
+            BarBuilder {
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                volume: volume.unwrap_or(0.0),
+                tick_count: 1,
+                datetime_start: event.datetime_ns,
+                datetime_end: event.datetime_ns,
+                timestamp_start: event.timestamp,
+                timestamp_end: event.timestamp,
+            },
+        )?;
+        return Ok(0);
     }
 
-    let mut completed_bars: Vec<BarBuilder> = Vec::new();
-    let mut current: Option<BarBuilder> = None;
+    let current = all_bars.last().expect("checked non-empty");
+    let upper = round4(current.open + range_size);
+    let lower = round4(current.open - range_size);
+    let required_new_bars = if price > upper {
+        let first_open = round4(current.low + range_size);
+        let remaining = (price - round4(first_open + range_size)).max(0.0);
+        1.0 + (remaining / range_size).ceil()
+    } else if price < lower {
+        let first_open = round4(current.high - range_size);
+        let remaining = (round4(first_open - range_size) - price).max(0.0);
+        1.0 + (remaining / range_size).ceil()
+    } else {
+        0.0
+    };
+    if !required_new_bars.is_finite()
+        || required_new_bars > (MAX_RANGE_BARS - all_bars.len()) as f64
+    {
+        return Err(format!(
+            "this price movement would exceed the safety limit of {MAX_RANGE_BARS} range bars; increase range_size or check the input price scale"
+        ));
+    }
+    all_bars
+        .try_reserve(required_new_bars as usize)
+        .map_err(|_| {
+            "not enough memory to create range bars; increase range_size or process a smaller price span"
+                .to_string()
+        })?;
 
-    for event in events {
-        let price = event.price;
+    loop {
+        let bar = all_bars.last_mut().expect("checked non-empty");
+        let upper = round4(bar.open + range_size);
+        let lower = round4(bar.open - range_size);
 
-        match current {
-            None => {
-                let mut bar = BarBuilder {
-                    open: price,
-                    high: price,
-                    low: price,
-                    close: price,
+        if price > upper {
+            bar.high = bar.low + range_size;
+            bar.close = bar.high;
+            bar.datetime_end = event.datetime_ns;
+            bar.timestamp_end = event.timestamp;
+            let new_open = bar.close;
+            push_bar(
+                all_bars,
+                BarBuilder {
+                    open: new_open,
+                    high: new_open,
+                    low: new_open,
+                    close: new_open,
                     volume: 0.0,
-                    tick_count: 1,
+                    tick_count: 0,
                     datetime_start: event.datetime_ns,
                     datetime_end: event.datetime_ns,
                     timestamp_start: event.timestamp,
                     timestamp_end: event.timestamp,
-                    ohlc_rows: std::collections::HashSet::new(),
-                };
-                match &event.kind {
-                    EventKind::Ohlc { row_id } => {
-                        bar.ohlc_rows.insert(*row_id);
-                    }
-                    EventKind::Price { volume } | EventKind::Single { volume } => {
-                        bar.volume += volume;
-                    }
-                }
-                current = Some(bar);
-            }
-            Some(ref mut bar) => loop {
-                let upper = round4(bar.open + range_size);
-                let lower = round4(bar.open - range_size);
+                },
+            )?;
+        } else if price < lower {
+            bar.low = bar.high - range_size;
+            bar.close = bar.low;
+            bar.datetime_end = event.datetime_ns;
+            bar.timestamp_end = event.timestamp;
+            let new_open = bar.close;
+            push_bar(
+                all_bars,
+                BarBuilder {
+                    open: new_open,
+                    high: new_open,
+                    low: new_open,
+                    close: new_open,
+                    volume: 0.0,
+                    tick_count: 0,
+                    datetime_start: event.datetime_ns,
+                    datetime_end: event.datetime_ns,
+                    timestamp_start: event.timestamp,
+                    timestamp_end: event.timestamp,
+                },
+            )?;
+        } else {
+            let bar = all_bars.last_mut().expect("checked non-empty");
+            let updated_high = bar.high.max(price);
+            let updated_low = bar.low.min(price);
 
-                if price > upper {
+            if updated_high - updated_low > range_size {
+                bar.high = updated_high;
+                bar.low = updated_low;
+                bar.datetime_end = event.datetime_ns;
+                bar.timestamp_end = event.timestamp;
+                if price > bar.open {
                     bar.high = bar.low + range_size;
                     bar.close = bar.high;
-                    bar.datetime_end = event.datetime_ns;
-                    bar.timestamp_end = event.timestamp;
-                    let finished = bar.clone();
-                    completed_bars.push(finished);
-
-                    let new_open = bar.close;
-                    *bar = BarBuilder {
-                        open: new_open,
-                        high: new_open,
-                        low: new_open,
-                        close: new_open,
-                        volume: 0.0,
-                        tick_count: 0,
-                        datetime_start: event.datetime_ns,
-                        datetime_end: event.datetime_ns,
-                        timestamp_start: event.timestamp,
-                        timestamp_end: event.timestamp,
-                        ohlc_rows: std::collections::HashSet::new(),
-                    };
-                } else if price < lower {
+                } else {
                     bar.low = bar.high - range_size;
                     bar.close = bar.low;
-                    bar.datetime_end = event.datetime_ns;
-                    bar.timestamp_end = event.timestamp;
-                    let finished = bar.clone();
-                    completed_bars.push(finished);
-
-                    let new_open = bar.close;
-                    *bar = BarBuilder {
+                }
+                let new_open = bar.close;
+                push_bar(
+                    all_bars,
+                    BarBuilder {
                         open: new_open,
                         high: new_open,
                         low: new_open,
@@ -204,97 +263,73 @@ fn compute_range_bars(
                         datetime_end: event.datetime_ns,
                         timestamp_start: event.timestamp,
                         timestamp_end: event.timestamp,
-                        ohlc_rows: std::collections::HashSet::new(),
-                    };
-                } else {
-                    bar.high = bar.high.max(price);
-                    bar.low = bar.low.min(price);
-                    bar.close = price;
-                    bar.tick_count += 1;
-                    bar.datetime_end = event.datetime_ns;
-                    bar.timestamp_end = event.timestamp;
-
-                    match &event.kind {
-                        EventKind::Ohlc { row_id } => {
-                            bar.ohlc_rows.insert(*row_id);
-                        }
-                        EventKind::Price { volume } | EventKind::Single { volume } => {
-                            bar.volume += volume;
-                        }
-                    }
-
-                    // Check if range exceeds range_size
-                    if bar.high - bar.low > range_size {
-                        // Close the bar and adjust high/low
-                        if price > bar.open {
-                            // Price moved up, close at upper adjusted boundary
-                            bar.high = bar.low + range_size;
-                            bar.close = bar.high;
-                        } else {
-                            // Price moved down, close at lower adjusted boundary
-                            bar.low = bar.high - range_size;
-                            bar.close = bar.low;
-                        }
-                        let finished = bar.clone();
-                        completed_bars.push(finished);
-
-                        let new_open = bar.close;
-                        *bar = BarBuilder {
-                            open: new_open,
-                            high: new_open,
-                            low: new_open,
-                            close: new_open,
-                            volume: 0.0,
-                            tick_count: 0,
-                            datetime_start: event.datetime_ns,
-                            datetime_end: event.datetime_ns,
-                            timestamp_start: event.timestamp,
-                            timestamp_end: event.timestamp,
-                            ohlc_rows: std::collections::HashSet::new(),
-                        };
-                        // Continue loop to process same price in new bar
-                    } else {
-                        break;
-                    }
-                }
-            },
-        }
-    }
-
-    let mut all_bars = completed_bars;
-    if let Some(bar) = current {
-        all_bars.push(bar);
-    }
-
-    let mut row_bar_indices: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, bar) in all_bars.iter().enumerate() {
-        for row_id in bar.ohlc_rows.iter() {
-            row_bar_indices.entry(*row_id).or_default().push(i);
-        }
-    }
-
-    for (row_id, bar_indices) in &row_bar_indices {
-        let meta = &ohlc_meta[*row_id as usize];
-        let row_volume = meta.volume;
-        let is_int = meta.is_int_volume;
-        let n = bar_indices.len();
-
-        if n == 1 {
-            all_bars[bar_indices[0]].volume += row_volume;
-        } else {
-            let portion = if is_int {
-                (row_volume / n as f64).round()
+                    },
+                )?;
             } else {
-                row_volume / n as f64
-            };
+                bar.high = updated_high;
+                bar.low = updated_low;
+                bar.close = price;
+                bar.tick_count += 1;
+                bar.datetime_end = event.datetime_ns;
+                bar.timestamp_end = event.timestamp;
+                if let Some(volume) = volume {
+                    bar.volume += volume;
+                }
+                return Ok(all_bars.len() - 1);
+            }
+        }
+    }
+}
 
-            let mut allocated = 0.0;
-            for (j, bar_idx) in bar_indices.iter().enumerate() {
-                if j < n - 1 {
-                    all_bars[*bar_idx].volume += portion;
-                    allocated += portion;
+fn compute_range_bars(
+    events: &[RawEvent],
+    range_size: f64,
+) -> Result<(Vec<OutputBar>, bool), String> {
+    let has_all_timestamps = !events.is_empty() && events.iter().all(|e| e.timestamp.is_some());
+
+    if events.is_empty() {
+        return Ok((Vec::new(), has_all_timestamps));
+    }
+
+    let mut all_bars: Vec<BarBuilder> = Vec::new();
+
+    for event in events {
+        match &event.kind {
+            EventKind::Price { volume } | EventKind::Single { volume } => {
+                process_price(
+                    &mut all_bars,
+                    event.price.expect("price event"),
+                    event,
+                    Some(*volume),
+                    range_size,
+                )?;
+            }
+            EventKind::Ohlc {
+                prices,
+                volume,
+                is_int_volume,
+            } => {
+                let first_bar_idx = all_bars.len().saturating_sub(1);
+                for price in prices {
+                    process_price(&mut all_bars, *price, event, None, range_size)?;
+                }
+
+                let last_bar_idx = all_bars.len() - 1;
+                let count = last_bar_idx - first_bar_idx + 1;
+                let portion = if *is_int_volume {
+                    (*volume / count as f64).round()
                 } else {
-                    all_bars[*bar_idx].volume += row_volume - allocated;
+                    *volume / count as f64
+                };
+                let mut allocated = 0.0;
+                for (position, bar_idx) in (first_bar_idx..=last_bar_idx).enumerate() {
+                    let amount = if position + 1 == count {
+                        *volume - allocated
+                    } else {
+                        allocated += portion;
+                        portion
+                    };
+                    all_bars[bar_idx].volume += amount;
                 }
             }
         }
@@ -316,7 +351,7 @@ fn compute_range_bars(
         })
         .collect();
 
-    (output, has_all_timestamps)
+    Ok((output, has_all_timestamps))
 }
 
 fn build_dataframe(bars: &[OutputBar], has_all_timestamps: bool) -> Result<DataFrame, String> {
@@ -539,18 +574,26 @@ fn extract_volume_col(col: &Series) -> PyResult<(Vec<f64>, bool)> {
     Ok((values, is_int))
 }
 
-fn append_events_and_sort(state: &mut InnerState, new_events: Vec<RawEvent>) {
-    let needs_sort = if let Some(last) = state.events.last() {
-        new_events.iter().any(|e| e.datetime_ns < last.datetime_ns)
-    } else {
-        false
-    };
+fn append_events_and_sort(state: &mut InnerState, new_events: Vec<RawEvent>) -> Result<(), String> {
+    let needs_sort = new_events
+        .windows(2)
+        .any(|pair| pair[1].datetime_ns < pair[0].datetime_ns)
+        || state.events.last().is_some_and(|last| {
+            new_events
+                .first()
+                .is_some_and(|first| first.datetime_ns < last.datetime_ns)
+        });
+    state.events.try_reserve(new_events.len()).map_err(|_| {
+        "not enough memory to retain input data; process smaller batches and call reset between datasets"
+            .to_string()
+    })?;
     state.events.extend(new_events);
     if needs_sort {
         state
             .events
             .sort_by(|a, b| a.datetime_ns.cmp(&b.datetime_ns).then(a.seq.cmp(&b.seq)));
     }
+    Ok(())
 }
 
 #[pyclass]
@@ -577,9 +620,7 @@ impl RangeBar {
             range_size: rounded,
             state: Arc::new(RwLock::new(InnerState {
                 events: Vec::new(),
-                ohlc_meta: Vec::new(),
                 next_seq: 0,
-                next_row_id: 0,
             })),
         })
     }
@@ -614,14 +655,14 @@ impl RangeBar {
         state.next_seq += 1;
 
         let event = RawEvent {
-            price,
+            price: Some(price),
             datetime_ns,
             timestamp,
             seq,
             kind: EventKind::Single { volume: ltq },
         };
 
-        append_events_and_sort(&mut state, vec![event]);
+        append_events_and_sort(&mut state, vec![event]).map_err(PyValueError::new_err)?;
         Ok(())
     }
 
@@ -654,7 +695,10 @@ impl RangeBar {
 
         let result: Result<Vec<RawEvent>, String> = py.detach(move || {
             let mut state = state_arc.write().map_err(|_| "lock poisoned".to_string())?;
-            let mut events = Vec::with_capacity(n);
+            let mut events = Vec::new();
+            events.try_reserve(n).map_err(|_| {
+                "not enough memory to retain input data; process a smaller batch".to_string()
+            })?;
             for i in 0..n {
                 // Skip rows where price <= 0
                 if prices[i] <= 0.0 {
@@ -662,7 +706,7 @@ impl RangeBar {
                 }
                 let ts = timestamps.as_ref().map(|t| t[i]);
                 events.push(RawEvent {
-                    price: prices[i],
+                    price: Some(prices[i]),
                     datetime_ns: datetimes[i],
                     timestamp: ts,
                     seq: state.next_seq,
@@ -679,7 +723,7 @@ impl RangeBar {
             .state
             .write()
             .map_err(|_| PyValueError::new_err("lock poisoned"))?;
-        append_events_and_sort(&mut state, new_events);
+        append_events_and_sort(&mut state, new_events).map_err(PyValueError::new_err)?;
         Ok(())
     }
 
@@ -729,72 +773,65 @@ impl RangeBar {
         }
 
         let state_arc = self.state.clone();
-        let result: Result<(Vec<RawEvent>, Vec<OhlcRowMeta>), String> = py.detach(move || {
+        let result: Result<Vec<RawEvent>, String> = py.detach(move || {
             let mut state = state_arc.write().map_err(|_| "lock poisoned".to_string())?;
-            let mut events = Vec::with_capacity(n * 4);
-            let mut new_meta = Vec::new();
+            let mut events = Vec::new();
+            events.try_reserve(n).map_err(|_| {
+                "not enough memory to retain OHLC data; process a smaller batch".to_string()
+            })?;
             for i in 0..n {
                 let o = opens[i];
                 let h = highs[i];
                 let l = lows[i];
                 let c = closes[i];
-                
+
                 // Skip rows where any of open/high/low/close <= 0
                 if o <= 0.0 || h <= 0.0 || l <= 0.0 || c <= 0.0 {
                     continue;
                 }
-                
+
                 let dt = datetimes[i];
                 let ts = timestamps.as_ref().map(|t| t[i]);
-                let vol = volumes[i];
-                let row_id = state.next_row_id;
-                state.next_row_id += 1;
-
-                new_meta.push(OhlcRowMeta {
-                    volume: vol,
-                    is_int_volume,
-                });
-
                 let tick_prices = if c >= o { [o, l, h, c] } else { [o, h, l, c] };
-
-                for tp in &tick_prices {
-                    events.push(RawEvent {
-                        price: *tp,
-                        datetime_ns: dt,
-                        timestamp: ts,
-                        seq: state.next_seq,
-                        kind: EventKind::Ohlc { row_id },
-                    });
-                    state.next_seq += 1;
-                }
+                events.push(RawEvent {
+                    price: None,
+                    datetime_ns: dt,
+                    timestamp: ts,
+                    seq: state.next_seq,
+                    kind: EventKind::Ohlc {
+                        prices: tick_prices,
+                        volume: volumes[i],
+                        is_int_volume,
+                    },
+                });
+                state.next_seq += 1;
             }
-            Ok((events, new_meta))
+            Ok(events)
         });
 
-        let (new_events, new_meta) = result.map_err(PyValueError::new_err)?;
+        let new_events = result.map_err(PyValueError::new_err)?;
 
         let mut state = self
             .state
             .write()
             .map_err(|_| PyValueError::new_err("lock poisoned"))?;
-        state.ohlc_meta.extend(new_meta);
-        append_events_and_sort(&mut state, new_events);
+        append_events_and_sort(&mut state, new_events).map_err(PyValueError::new_err)?;
         Ok(())
     }
 
     fn get(&self, py: Python<'_>) -> PyResult<PyDataFrame> {
-        let (events, ohlc_meta) = {
+        let events = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| PyValueError::new_err("lock poisoned"))?;
-            (state.events.clone(), state.ohlc_meta.clone())
+            state.events.clone()
         };
         let range_size = self.range_size;
 
         let df = py
             .detach(move || {
-                let (bars, has_all_ts) = compute_range_bars(&events, &ohlc_meta, range_size);
+                let (bars, has_all_ts) = compute_range_bars(&events, range_size)?;
                 build_dataframe(&bars, has_all_ts)
             })
             .map_err(PyValueError::new_err)?;
@@ -808,9 +845,87 @@ impl RangeBar {
             .write()
             .map_err(|_| PyValueError::new_err("lock poisoned"))?;
         state.events.clear();
-        state.ohlc_meta.clear();
         state.next_seq = 0;
-        state.next_row_id = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn price_event(price: f64, seq: u64) -> RawEvent {
+        RawEvent {
+            price: Some(price),
+            datetime_ns: seq as i64,
+            timestamp: Some(seq as i64),
+            seq,
+            kind: EventKind::Price { volume: 1.0 },
+        }
+    }
+
+    #[test]
+    fn matches_documented_price_sequence() {
+        let prices = [
+            100.0, 105.0, 110.0, 109.0, 112.0, 116.0, 119.0, 123.0, 127.0, 129.0, 135.0, 129.0,
+            123.0, 118.0, 112.0, 118.0, 124.0, 119.0,
+        ];
+        let events: Vec<_> = prices
+            .into_iter()
+            .enumerate()
+            .map(|(seq, price)| price_event(price, seq as u64))
+            .collect();
+
+        let (bars, has_timestamps) = compute_range_bars(&events, 10.0).unwrap();
+        let values: Vec<_> = bars
+            .iter()
+            .map(|bar| (bar.open, bar.high, bar.low, bar.close))
+            .collect();
+
+        assert!(has_timestamps);
+        assert_eq!(bars.iter().map(|bar| bar.tick_count).sum::<u64>(), 18);
+        assert_eq!(bars.iter().map(|bar| bar.volume).sum::<f64>(), 18.0);
+        assert_eq!(
+            values,
+            vec![
+                (100.0, 110.0, 100.0, 110.0),
+                (110.0, 120.0, 110.0, 120.0),
+                (120.0, 130.0, 120.0, 130.0),
+                (130.0, 135.0, 125.0, 125.0),
+                (125.0, 125.0, 115.0, 115.0),
+                (115.0, 122.0, 112.0, 122.0),
+                (122.0, 124.0, 119.0, 119.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn ohlc_volume_is_split_across_every_generated_bar() {
+        let event = RawEvent {
+            price: None,
+            datetime_ns: 1,
+            timestamp: None,
+            seq: 0,
+            kind: EventKind::Ohlc {
+                prices: [100.0, 100.0, 145.0, 145.0],
+                volume: 11.0,
+                is_int_volume: true,
+            },
+        };
+
+        let (bars, _) = compute_range_bars(&[event], 10.0).unwrap();
+        assert_eq!(bars.len(), 5);
+        assert_eq!(
+            bars.iter().map(|bar| bar.volume).collect::<Vec<_>>(),
+            vec![2.0, 2.0, 2.0, 2.0, 3.0]
+        );
+        assert_eq!(bars.iter().map(|bar| bar.tick_count).sum::<u64>(), 4);
+    }
+
+    #[test]
+    fn rejects_impossibly_large_output_before_allocating_it() {
+        let events = vec![price_event(1.0, 0), price_event(2_000.0, 1)];
+        let error = compute_range_bars(&events, 0.0001).unwrap_err();
+        assert!(error.contains("safety limit"));
     }
 }
