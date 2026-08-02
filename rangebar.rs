@@ -61,17 +61,9 @@ fn to_polars_df(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<DataFrame> {
 
 #[derive(Clone, Debug)]
 enum EventKind {
-    Ohlc {
-        row_id: u64,
-        row_volume: f64,
-        is_int_volume: bool,
-    },
-    Price {
-        volume: f64,
-    },
-    Single {
-        volume: f64,
-    },
+    Ohlc { row_id: u64 },
+    Price { volume: f64 },
+    Single { volume: f64 },
 }
 
 #[derive(Clone, Debug)]
@@ -83,8 +75,15 @@ struct RawEvent {
     kind: EventKind,
 }
 
+#[derive(Clone, Debug)]
+struct OhlcRowMeta {
+    volume: f64,
+    is_int_volume: bool,
+}
+
 struct InnerState {
     events: Vec<RawEvent>,
+    ohlc_meta: Vec<OhlcRowMeta>,
     next_seq: u64,
     next_row_id: u64,
 }
@@ -101,7 +100,7 @@ struct BarBuilder {
     datetime_end: i64,
     timestamp_start: Option<i64>,
     timestamp_end: Option<i64>,
-    ohlc_rows: HashMap<u64, (f64, bool)>,
+    ohlc_rows: std::collections::HashSet<u64>,
 }
 
 struct OutputBar {
@@ -117,7 +116,11 @@ struct OutputBar {
     timestamp_end: Option<i64>,
 }
 
-fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, bool) {
+fn compute_range_bars(
+    events: &[RawEvent],
+    ohlc_meta: &[OhlcRowMeta],
+    range_size: f64,
+) -> (Vec<OutputBar>, bool) {
     let has_all_timestamps = !events.is_empty() && events.iter().all(|e| e.timestamp.is_some());
 
     if events.is_empty() {
@@ -143,15 +146,11 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
                     datetime_end: event.datetime_ns,
                     timestamp_start: event.timestamp,
                     timestamp_end: event.timestamp,
-                    ohlc_rows: HashMap::new(),
+                    ohlc_rows: std::collections::HashSet::new(),
                 };
                 match &event.kind {
-                    EventKind::Ohlc {
-                        row_id,
-                        row_volume,
-                        is_int_volume,
-                    } => {
-                        bar.ohlc_rows.insert(*row_id, (*row_volume, *is_int_volume));
+                    EventKind::Ohlc { row_id } => {
+                        bar.ohlc_rows.insert(*row_id);
                     }
                     EventKind::Price { volume } | EventKind::Single { volume } => {
                         bar.volume += volume;
@@ -183,7 +182,7 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
                         datetime_end: event.datetime_ns,
                         timestamp_start: event.timestamp,
                         timestamp_end: event.timestamp,
-                        ohlc_rows: HashMap::new(),
+                        ohlc_rows: std::collections::HashSet::new(),
                     };
                 } else if price < lower {
                     bar.low = bar.high - range_size;
@@ -205,7 +204,7 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
                         datetime_end: event.datetime_ns,
                         timestamp_start: event.timestamp,
                         timestamp_end: event.timestamp,
-                        ohlc_rows: HashMap::new(),
+                        ohlc_rows: std::collections::HashSet::new(),
                     };
                 } else {
                     bar.high = bar.high.max(price);
@@ -216,14 +215,8 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
                     bar.timestamp_end = event.timestamp;
 
                     match &event.kind {
-                        EventKind::Ohlc {
-                            row_id,
-                            row_volume,
-                            is_int_volume,
-                        } => {
-                            bar.ohlc_rows
-                                .entry(*row_id)
-                                .or_insert((*row_volume, *is_int_volume));
+                        EventKind::Ohlc { row_id } => {
+                            bar.ohlc_rows.insert(*row_id);
                         }
                         EventKind::Price { volume } | EventKind::Single { volume } => {
                             bar.volume += volume;
@@ -257,7 +250,7 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
                             datetime_end: event.datetime_ns,
                             timestamp_start: event.timestamp,
                             timestamp_end: event.timestamp,
-                            ohlc_rows: HashMap::new(),
+                            ohlc_rows: std::collections::HashSet::new(),
                         };
                         // Continue loop to process same price in new bar
                     } else {
@@ -275,13 +268,15 @@ fn compute_range_bars(events: &[RawEvent], range_size: f64) -> (Vec<OutputBar>, 
 
     let mut row_bar_indices: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, bar) in all_bars.iter().enumerate() {
-        for row_id in bar.ohlc_rows.keys() {
+        for row_id in bar.ohlc_rows.iter() {
             row_bar_indices.entry(*row_id).or_default().push(i);
         }
     }
 
     for (row_id, bar_indices) in &row_bar_indices {
-        let (row_volume, is_int) = all_bars[bar_indices[0]].ohlc_rows[row_id];
+        let meta = &ohlc_meta[*row_id as usize];
+        let row_volume = meta.volume;
+        let is_int = meta.is_int_volume;
         let n = bar_indices.len();
 
         if n == 1 {
@@ -582,6 +577,7 @@ impl RangeBar {
             range_size: rounded,
             state: Arc::new(RwLock::new(InnerState {
                 events: Vec::new(),
+                ohlc_meta: Vec::new(),
                 next_seq: 0,
                 next_row_id: 0,
             })),
@@ -733,9 +729,10 @@ impl RangeBar {
         }
 
         let state_arc = self.state.clone();
-        let result: Result<Vec<RawEvent>, String> = py.detach(move || {
+        let result: Result<(Vec<RawEvent>, Vec<OhlcRowMeta>), String> = py.detach(move || {
             let mut state = state_arc.write().map_err(|_| "lock poisoned".to_string())?;
             let mut events = Vec::with_capacity(n * 4);
+            let mut new_meta = Vec::new();
             for i in 0..n {
                 let o = opens[i];
                 let h = highs[i];
@@ -753,6 +750,11 @@ impl RangeBar {
                 let row_id = state.next_row_id;
                 state.next_row_id += 1;
 
+                new_meta.push(OhlcRowMeta {
+                    volume: vol,
+                    is_int_volume,
+                });
+
                 let tick_prices = if c >= o { [o, l, h, c] } else { [o, h, l, c] };
 
                 for tp in &tick_prices {
@@ -761,41 +763,38 @@ impl RangeBar {
                         datetime_ns: dt,
                         timestamp: ts,
                         seq: state.next_seq,
-                        kind: EventKind::Ohlc {
-                            row_id,
-                            row_volume: vol,
-                            is_int_volume,
-                        },
+                        kind: EventKind::Ohlc { row_id },
                     });
                     state.next_seq += 1;
                 }
             }
-            Ok(events)
+            Ok((events, new_meta))
         });
 
-        let new_events = result.map_err(PyValueError::new_err)?;
+        let (new_events, new_meta) = result.map_err(PyValueError::new_err)?;
 
         let mut state = self
             .state
             .write()
             .map_err(|_| PyValueError::new_err("lock poisoned"))?;
+        state.ohlc_meta.extend(new_meta);
         append_events_and_sort(&mut state, new_events);
         Ok(())
     }
 
     fn get(&self, py: Python<'_>) -> PyResult<PyDataFrame> {
-        let events = {
+        let (events, ohlc_meta) = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| PyValueError::new_err("lock poisoned"))?;
-            state.events.clone()
+            (state.events.clone(), state.ohlc_meta.clone())
         };
         let range_size = self.range_size;
 
         let df = py
             .detach(move || {
-                let (bars, has_all_ts) = compute_range_bars(&events, range_size);
+                let (bars, has_all_ts) = compute_range_bars(&events, &ohlc_meta, range_size);
                 build_dataframe(&bars, has_all_ts)
             })
             .map_err(PyValueError::new_err)?;
@@ -809,6 +808,7 @@ impl RangeBar {
             .write()
             .map_err(|_| PyValueError::new_err("lock poisoned"))?;
         state.events.clear();
+        state.ohlc_meta.clear();
         state.next_seq = 0;
         state.next_row_id = 0;
         Ok(())
